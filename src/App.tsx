@@ -24,6 +24,7 @@ import type {
   LanguageCode,
   DashboardSnapshot,
   ConversationMessage,
+  ClientAction,
 } from './types';
 import { VoiceConsoleView } from './components/VoiceConsoleView';
 import { SalesPosView } from './components/SalesPosView';
@@ -104,6 +105,7 @@ export default function App() {
   const speechTranscriptRef = useRef<string>('');
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const spaceHeldRef = useRef(false);
+  const handledTurnIdsRef = useRef<Set<string>>(new Set());
 
   const showToast = useCallback((text: string, tone: 'info' | 'success' | 'error' = 'info') => {
     setToast({ text, tone });
@@ -111,6 +113,43 @@ export default function App() {
       setToast((prev) => (prev?.text === text ? null : prev));
     }, 4500);
   }, []);
+
+  const triggerFileDownload = useCallback(async (url: string, filename = 'VaaniBiz-Invoice.pdf') => {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Failed to download invoice');
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+      showToast(`Downloaded ${filename}`, 'success');
+    } catch {
+      showToast('Could not download PDF invoice', 'error');
+    }
+  }, [showToast]);
+
+  const executeClientActions = useCallback(
+    (actions?: ClientAction[]) => {
+      if (!actions || actions.length === 0) return;
+      for (const act of actions) {
+        if (act.type === 'download_invoice' && act.url) {
+          triggerFileDownload(act.url, act.filename || 'VaaniBiz-Invoice.pdf');
+        } else if (act.type === 'navigate' && act.tab) {
+          setActiveTab(act.tab);
+        } else if (act.type === 'set_language' && act.language) {
+          setLanguage(act.language);
+        } else if (act.type === 'toast' && act.message) {
+          showToast(act.message, act.tone || 'info');
+        }
+      }
+    },
+    [showToast, triggerFileDownload]
+  );
 
   const fetchSnapshot = useCallback(async () => {
     try {
@@ -130,6 +169,66 @@ export default function App() {
   useEffect(() => {
     fetchSnapshot();
   }, [fetchSnapshot]);
+
+  // Real-time SSE sync for Agora Conversational AI (/api/llm) & background updates
+  useEffect(() => {
+    const es = new EventSource('/api/events');
+    es.onmessage = (ev) => {
+      try {
+        const payload = JSON.parse(ev.data);
+        if (payload.snapshot) {
+          setSnapshot(payload.snapshot);
+        }
+        if (payload.type === 'agent_turn' && payload.source === 'agora_convo_ai') {
+          if (payload.turnId && handledTurnIdsRef.current.has(payload.turnId)) return;
+          if (payload.turnId) handledTurnIdsRef.current.add(payload.turnId);
+
+          const timeNow = new Date().toLocaleTimeString('en-IN', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          });
+          const appliedChanges = (payload.toolRuns || []).map((t: any) => t.rpcLabel);
+
+          setMessages((prev) => [
+            ...prev,
+            ...(payload.utterance
+              ? [
+                  {
+                    id: `agora-u-${Date.now()}`,
+                    role: 'user' as const,
+                    speakerLabel: 'Owner (Agora RTC)',
+                    languageTag: payload.detectedLanguage || 'Agora Voice',
+                    timestamp: timeNow,
+                    text: payload.utterance,
+                  },
+                ]
+              : []),
+            ...(payload.replyText
+              ? [
+                  {
+                    id: `agora-ai-${Date.now()}`,
+                    role: 'assistant' as const,
+                    speakerLabel: 'Vaani AI (Agora ConvoAI)',
+                    languageTag: 'Agora Live Sync',
+                    timestamp: timeNow,
+                    text: payload.replyText,
+                    appliedChanges,
+                    clientActions: payload.clientActions,
+                  },
+                ]
+              : []),
+          ]);
+          executeClientActions(payload.clientActions);
+        }
+      } catch {
+        // Ignore malformed SSE frame
+      }
+    };
+    return () => {
+      es.close();
+    };
+  }, [executeClientActions]);
 
   const playBase64Audio = useCallback(
     (base64: string, mimeType: string) => {
@@ -280,11 +379,15 @@ export default function App() {
             ttsProvider: data.ttsProvider,
             audioBase64: data.audioBase64,
             audioMimeType: data.audioMimeType,
+            appliedChanges: data.appliedChanges,
+            clientActions: data.clientActions,
           },
         ]);
 
+        if (data.turnId) handledTurnIdsRef.current.add(data.turnId);
         if (data.latencyMs) setLastLatencyMs(data.latencyMs);
         if (data.snapshot) setSnapshot(data.snapshot);
+        if (data.clientActions) executeClientActions(data.clientActions);
 
         if (data.audioBase64 && data.audioMimeType) {
           playBase64Audio(data.audioBase64, data.audioMimeType);
@@ -297,7 +400,7 @@ export default function App() {
         setIsProcessing(false);
       }
     },
-    [agoraSessionId, language, messages, playBase64Audio, showToast, snapshot?.profile?.owner_name]
+    [agoraSessionId, executeClientActions, language, messages, playBase64Audio, showToast, snapshot?.profile?.owner_name]
   );
 
   // Stop Microphone Recording & Dispatch to Voice Turn
@@ -582,6 +685,30 @@ export default function App() {
       setSnapshot(data.snapshot);
       showToast('PO marked received — inventory stock synced atomically!', 'success');
     }
+  };
+
+  const handlePayPO = async (poId: number, paymentMode = 'UPI') => {
+    const res = await fetch(`/api/purchase-orders/${poId}/pay`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payment_mode: paymentMode }),
+    });
+    const data = await res.json();
+    if (res.ok && data.snapshot) {
+      setSnapshot(data.snapshot);
+      showToast(`Payment recorded via ${paymentMode}!`, 'success');
+    } else {
+      showToast(data.error || 'Payment failed', 'error');
+    }
+  };
+
+  const handleDownloadInvoice = async (type: 'sale' | 'purchase_order', ref: string) => {
+    const safeRef = ref.replace(/[^a-zA-Z0-9_-]/g, '');
+    const prefix = type === 'purchase_order' ? 'VaaniBiz-PO' : 'VaaniBiz-Invoice';
+    await triggerFileDownload(
+      `/api/invoices/download?type=${type}&ref=${encodeURIComponent(ref)}`,
+      `${prefix}-${safeRef}.pdf`
+    );
   };
 
   const handleCreateSale = async (payload: {
@@ -1027,6 +1154,7 @@ export default function App() {
               snapshot={snapshot}
               onCreateSale={handleCreateSale}
               onPlayTranscriptAudio={playTextWithTTS}
+              onDownloadInvoice={handleDownloadInvoice}
               onNavigate={setActiveTab}
               onTriggerVoicePrompt={triggerVoiceFromTab}
             />
@@ -1050,6 +1178,8 @@ export default function App() {
               onCancelApproval={handleCancelApproval}
               onDraftPO={handleDraftPO}
               onReceivePO={handleReceivePO}
+              onPayPO={handlePayPO}
+              onDownloadInvoice={handleDownloadInvoice}
               onTriggerVoicePrompt={triggerVoiceFromTab}
             />
           )}

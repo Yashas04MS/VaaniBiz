@@ -26,6 +26,7 @@ interface SalesPosViewProps {
     items: { product_id: number; quantity: number }[];
   }) => Promise<void>;
   onPlayTranscriptAudio: (text: string) => Promise<void>;
+  onDownloadInvoice: (type: 'sale' | 'purchase_order', ref: string) => Promise<void>;
   onNavigate: (tab: NavTab) => void;
   onTriggerVoicePrompt: (prompt: string) => Promise<void>;
 }
@@ -34,6 +35,7 @@ export function SalesPosView({
   snapshot,
   onCreateSale,
   onPlayTranscriptAudio,
+  onDownloadInvoice,
   onNavigate,
   onTriggerVoicePrompt,
 }: SalesPosViewProps) {
@@ -632,7 +634,8 @@ export function SalesPosView({
                 <th className="py-3 px-3">Cart Summary (सामग्री)</th>
                 <th className="py-3 px-3 text-right">Amount</th>
                 <th className="py-3 px-3">Payment Mode</th>
-                <th className="py-3 pl-3">Voice Input Audio</th>
+                <th className="py-3 px-3">Voice Input Audio</th>
+                <th className="py-3 pl-3 text-right">Invoice</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs sm:text-sm">
@@ -670,7 +673,7 @@ export function SalesPosView({
                       {sale.payment_mode}
                     </span>
                   </td>
-                  <td className="py-3.5 pl-3">
+                  <td className="py-3.5 px-3">
                     {sale.voice_transcript ? (
                       <button
                         type="button"
@@ -687,6 +690,17 @@ export function SalesPosView({
                     ) : (
                       <span className="text-xs text-slate-400">Manual POS Entry</span>
                     )}
+                  </td>
+                  <td className="py-3.5 pl-3 text-right whitespace-nowrap">
+                    <button
+                      type="button"
+                      onClick={() => onDownloadInvoice('sale', sale.bill_no)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-[11px] font-semibold transition-colors"
+                      title={`Download PDF Invoice for ${sale.bill_no}`}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>PDF</span>
+                    </button>
                   </td>
                 </tr>
               ))}

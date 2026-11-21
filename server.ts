@@ -6,23 +6,110 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { z } from 'zod';
 import {
-  initDatabase,
-  db,
-  getDashboardSnapshot,
+  actionReminder,
+  addProduct,
   applyStockMovement,
   createApprovalAndPO,
-  resolveApproval,
+  createReminder,
+  emitDashboardEvent,
+  findPurchaseOrderByRef,
+  findSaleByRef,
+  getBestSupplierForProduct,
+  getDashboardSnapshot,
+  getHealthRows,
+  getLowStockItems,
+  getProductCount,
+  getProfile,
+  initDatabase,
+  payPurchaseOrder,
   receivePurchaseOrder,
   recordHealth,
+  recordKhataPayment,
+  recordSaleTransaction,
+  resolveApproval,
+  subscribeDashboardEvents,
+  updateProfile,
+  updateReadyHealth,
 } from './server/db.ts';
 import { runVoiceAgentTurn, transcribeAudioWithGemini } from './server/agent.ts';
 import { synthesizeSpeech, startAgoraSession, stopAgoraSession } from './server/voice.ts';
 import { getGeminiDiagnostics } from './server/geminiClient.ts';
+import { generatePurchaseOrderInvoicePdf, generateSaleInvoicePdf } from './server/invoice.ts';
 
 initDatabase();
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
+
+// Real-time Server-Sent Events stream so Agora Conversational AI (/api/llm)
+// and voice actions synchronize automatically to all connected UI clients
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  res.write(`data: ${JSON.stringify({ type: 'connected', snapshot: getDashboardSnapshot() })}\n\n`);
+
+  const unsubscribe = subscribeDashboardEvents((event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  });
+
+  const keepAlive = setInterval(() => {
+    res.write(': ping\n\n');
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    unsubscribe();
+  });
+});
+
+// Download PDF Invoice for POS Sales Bills or Supplier Purchase Orders
+app.get('/api/invoices/download', (req, res) => {
+  try {
+    const type = String(req.query.type || 'sale');
+    const ref = req.query.ref ? String(req.query.ref) : undefined;
+    const profile = getProfile();
+
+    if (type === 'purchase_order' || type === 'po') {
+      const found = findPurchaseOrderByRef(ref);
+      if (!found) {
+        res.status(404).json({ error: 'Purchase order invoice not found' });
+        return;
+      }
+      const pdf = generatePurchaseOrderInvoicePdf({
+        shopName: profile.shop_name,
+        storeCode: profile.store_code,
+        location: profile.location,
+        po: found.po,
+        items: found.items,
+      });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+      res.send(pdf.buffer);
+      return;
+    }
+
+    const found = findSaleByRef(ref);
+    if (!found) {
+      res.status(404).json({ error: 'Sale invoice not found' });
+      return;
+    }
+    const pdf = generateSaleInvoicePdf({
+      shopName: profile.shop_name,
+      storeCode: profile.store_code,
+      location: profile.location,
+      sale: found.sale,
+      items: found.items,
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${pdf.filename}"`);
+    res.send(pdf.buffer);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to generate invoice PDF' });
+  }
+});
 
 // Health & integration telemetry
 app.get('/api/health', (_req, res) => {
@@ -32,21 +119,19 @@ app.get('/api/health', (_req, res) => {
   const agoraOk = Boolean(process.env.AGORA_APP_ID && process.env.AGORA_APP_CERTIFICATE);
 
   if (geminiOk) {
-    db.prepare("UPDATE integration_health SET status = 'ready', detail = ? WHERE service = 'gemini' AND status = 'missing_key'")
-      .run(`${geminiDiag.primaryModel} (${geminiDiag.mode})`);
+    updateReadyHealth('gemini', `${geminiDiag.primaryModel} (${geminiDiag.mode})`);
   }
   if (murfOk) {
-    db.prepare("UPDATE integration_health SET status = 'ready', detail = ? WHERE service = 'murf' AND status = 'missing_key'").run(`Voice ${process.env.MURF_VOICE_ID || 'en-IN-anisha'} ready`);
+    updateReadyHealth('murf', `Voice ${process.env.MURF_VOICE_ID || 'en-IN-anisha'} ready`);
   }
   if (agoraOk) {
-    db.prepare("UPDATE integration_health SET status = 'ready', detail = 'RTC token minting & ConvoAI ready' WHERE service = 'agora' AND status = 'missing_key'").run();
+    updateReadyHealth('agora', 'RTC token minting & ConvoAI ready');
   }
 
-  const healthRows = db.prepare('SELECT * FROM integration_health').all();
   res.json({
     ok: true,
     timestamp: new Date().toISOString(),
-    integrations: healthRows,
+    integrations: getHealthRows(),
     config: {
       geminiConfigured: geminiOk,
       geminiMode: geminiDiag.mode,
@@ -58,17 +143,15 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-// Live verification ping across Gemini, Murf, Agora, and SQLite
+// Live verification ping across Gemini, Murf, Agora, and In-Memory Ledger
 app.post('/api/health/verify', async (_req, res) => {
   const results: Record<string, { status: string; detail: string; latencyMs: number }> = {};
 
-  // SQLite check
   const dbStart = Date.now();
-  const cnt = db.prepare('SELECT COUNT(*) as c FROM products').get() as { c: number };
-  results.sqlite = { status: 'healthy', detail: `${cnt.c} SKUs verified in ledger`, latencyMs: Date.now() - dbStart };
-  recordHealth('sqlite', 'healthy', results.sqlite.detail, results.sqlite.latencyMs);
+  const cnt = getProductCount();
+  results.ledger = { status: 'healthy', detail: `${cnt} SKUs verified in ledger`, latencyMs: Date.now() - dbStart };
+  recordHealth('ledger', 'healthy', results.ledger.detail, results.ledger.latencyMs);
 
-  // Agora token mint check
   const agStart = Date.now();
   if (process.env.AGORA_APP_ID && process.env.AGORA_APP_CERTIFICATE) {
     try {
@@ -85,7 +168,6 @@ app.post('/api/health/verify', async (_req, res) => {
     recordHealth('agora', 'missing_key', results.agora.detail, 0);
   }
 
-  // Gemini check
   const gStart = Date.now();
   try {
     const turn = await runVoiceAgentTurn({ utterance: 'Check sugar stock briefly', sessionId: 'health-check' });
@@ -95,7 +177,6 @@ app.post('/api/health/verify', async (_req, res) => {
     recordHealth('gemini', 'error', results.gemini.detail, results.gemini.latencyMs);
   }
 
-  // Murf check
   const mStart = Date.now();
   try {
     const tts = await synthesizeSpeech('VaaniBiz voice engine healthy.', 'en');
@@ -132,21 +213,9 @@ app.patch('/api/profile', (req, res) => {
     res.status(400).json({ error: 'Invalid profile update payload' });
     return;
   }
-  const d = parsed.data;
-  const current = db.prepare('SELECT * FROM merchant_profile WHERE id = 1').get() as any;
-  db.prepare(`
-    UPDATE merchant_profile
-    SET shop_name = ?, location = ?, owner_name = ?, preferred_language = ?, approval_qty_threshold = ?, approval_value_threshold = ?
-    WHERE id = 1
-  `).run(
-    d.shop_name ?? current.shop_name,
-    d.location ?? current.location,
-    d.owner_name ?? current.owner_name,
-    d.preferred_language ?? current.preferred_language,
-    d.approval_qty_threshold ?? current.approval_qty_threshold,
-    d.approval_value_threshold ?? current.approval_value_threshold
-  );
-  res.json(db.prepare('SELECT * FROM merchant_profile WHERE id = 1').get());
+  const updated = updateProfile(parsed.data);
+  emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+  res.json(updated);
 });
 
 // Agora RTC + Conversational AI session start / stop
@@ -200,6 +269,18 @@ app.post('/api/llm', async (req, res) => {
       .map((m: any) => ({ role: m.role as 'user' | 'assistant', text: String(m.content || '') }));
 
     const turn = await runVoiceAgentTurn({ utterance, sessionId, history });
+
+    // Broadcast live Agora ConvoAI turn & automatic client actions (downloads, tab switches, ledger updates)
+    emitDashboardEvent({
+      type: 'agent_turn',
+      turnId: `agora-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      source: 'agora_convo_ai',
+      utterance,
+      replyText: turn.replyText,
+      detectedLanguage: turn.detectedLanguage,
+      toolRuns: turn.toolRuns,
+      clientActions: turn.clientActions,
+    });
 
     if (req.body?.stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -284,7 +365,15 @@ app.post('/api/voice/turn', async (req, res) => {
       }
     }
 
+    const turnId = `voice-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    emitDashboardEvent({
+      type: 'snapshot_updated',
+      turnId,
+      source: 'browser_voice',
+    });
+
     res.json({
+      turnId,
       utterance,
       ...turn,
       audioBase64,
@@ -336,24 +425,9 @@ app.post('/api/inventory/products', (req, res) => {
     res.status(400).json({ error: 'Invalid product details' });
     return;
   }
-  const d = parsed.data;
-  const sku = d.sku || `SKU-${Date.now().toString(36).toUpperCase()}`;
-  const now = new Date().toISOString();
-
-  const tx = db.transaction(() => {
-    const info = db.prepare(`
-      INSERT INTO products (sku, hsn, name, hindi_alias, kannada_alias, unit, pack_size, price, cost, mrp, reorder_level, category, daily_velocity)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2.5)
-    `).run(sku, d.hsn, d.name, d.hindi_alias, d.kannada_alias, d.unit, d.pack_size, d.price, d.cost, d.mrp, d.reorder_level, d.category);
-    const pid = Number(info.lastInsertRowid);
-    db.prepare('INSERT INTO inventory (product_id, quantity, updated_at) VALUES (?, ?, ?)').run(pid, d.initial_qty, now);
-    if (d.hindi_alias) db.prepare('INSERT INTO product_aliases (product_id, alias, language) VALUES (?, ?, ?)').run(pid, d.hindi_alias, 'hi');
-    if (d.kannada_alias) db.prepare('INSERT INTO product_aliases (product_id, alias, language) VALUES (?, ?, ?)').run(pid, d.kannada_alias, 'kn');
-    return pid;
-  });
-
-  const pid = tx();
-  res.json({ ok: true, id: pid, snapshot: getDashboardSnapshot() });
+  const created = addProduct(parsed.data);
+  emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+  res.json({ ok: true, id: created.id, snapshot: getDashboardSnapshot() });
 });
 
 app.post('/api/inventory/adjust', (req, res) => {
@@ -369,6 +443,7 @@ app.post('/api/inventory/adjust', (req, res) => {
   }
   try {
     const nextQty = applyStockMovement(parsed.data.productId, parsed.data.delta, parsed.data.reason, 'manual', null, false);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
     res.json({ ok: true, nextQty, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Stock adjustment failed' });
@@ -390,45 +465,9 @@ app.post('/api/sales', (req, res) => {
   }
 
   try {
-    const tx = db.transaction(() => {
-      let totalAmount = 0;
-      const resolved: { product: any; qty: number; lineTotal: number }[] = [];
-      for (const line of parsed.data.items) {
-        const product = db.prepare('SELECT * FROM products WHERE id = ?').get(line.product_id) as any;
-        if (!product) throw new Error('Product not found');
-        const lineTotal = Math.round(product.price * line.quantity);
-        totalAmount += lineTotal;
-        resolved.push({ product, qty: line.quantity, lineTotal });
-      }
-      const billNo = `#POS-${4782 + Math.floor(Math.random() * 500)}`;
-      const summary = resolved.map((r) => `${r.product.name} x ${r.qty}`).join(', ');
-      const now = new Date().toISOString();
-      const saleId = Number(db.prepare(`
-        INSERT INTO sales (bill_no, customer_name, customer_sublabel, payment_mode, total_amount, cart_summary, voice_transcript, idempotency_key, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)
-      `).run(billNo, parsed.data.customer_name, parsed.data.customer_sublabel, parsed.data.payment_mode, totalAmount, summary, `pos-${Date.now()}-${Math.random()}`, now).lastInsertRowid);
-
-      for (const r of resolved) {
-        applyStockMovement(r.product.id, -r.qty, `POS Bill ${billNo}`, 'sale', billNo, false);
-        db.prepare('INSERT INTO sale_items (sale_id, product_id, product_name, quantity, unit_price, line_total) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(saleId, r.product.id, r.product.name, r.qty, r.product.price, r.lineTotal);
-      }
-
-      if (parsed.data.payment_mode.toLowerCase().includes('udhaar')) {
-        const existing = db.prepare('SELECT * FROM khata_customers WHERE lower(name) LIKE ?').get(`%${parsed.data.customer_name.toLowerCase()}%`) as any;
-        if (existing) {
-          db.prepare('UPDATE khata_customers SET balance_due = balance_due + ?, last_activity = ? WHERE id = ?')
-            .run(totalAmount, `Added ₹${totalAmount} via ${billNo}`, existing.id);
-        } else {
-          db.prepare('INSERT INTO khata_customers (book_no, name, phone, balance_due, last_activity) VALUES (?, ?, ?, ?, ?)')
-            .run(`Khata Book #${Math.floor(20 + Math.random() * 70)}`, parsed.data.customer_name, '+91 98450 00000', totalAmount, `Opened ₹${totalAmount} via ${billNo}`);
-        }
-      }
-      return billNo;
-    });
-
-    const billNo = tx();
-    res.json({ ok: true, billNo, snapshot: getDashboardSnapshot() });
+    const saleRes = recordSaleTransaction(parsed.data);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+    res.json({ ok: true, billNo: saleRes.billNo, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Failed to record sale' });
   }
@@ -448,6 +487,7 @@ app.post('/api/purchase-orders', (req, res) => {
   }
   try {
     const po = createApprovalAndPO(parsed.data.supplier_id, parsed.data.product_id, parsed.data.quantity, 'Merchant Dashboard');
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
     res.json({ ok: true, ...po, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Failed to draft purchase order' });
@@ -455,19 +495,14 @@ app.post('/api/purchase-orders', (req, res) => {
 });
 
 app.post('/api/purchase-orders/auto-draft-low', (_req, res) => {
-  const lowItems = db.prepare(`
-    SELECT p.*, i.quantity as stock_qty
-    FROM products p JOIN inventory i ON i.product_id = p.id
-    WHERE i.quantity <= p.reorder_level
-  `).all() as any[];
-
+  const lowItems = getLowStockItems();
   const drafted: any[] = [];
   for (const item of lowItems) {
-    const bestQuote = db.prepare('SELECT supplier_id FROM supplier_prices WHERE product_id = ? ORDER BY unit_price ASC LIMIT 1').get(item.id) as { supplier_id: number } | undefined;
-    const supplierId = bestQuote?.supplier_id || 1;
+    const supplierId = getBestSupplierForProduct(item.id);
     const qty = Math.max(item.reorder_level * 2 - item.stock_qty, 10);
     drafted.push(createApprovalAndPO(supplierId, item.id, qty, 'Auto-Replenish'));
   }
+  emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
   res.json({ ok: true, count: drafted.length, drafted, snapshot: getDashboardSnapshot() });
 });
 
@@ -475,15 +510,34 @@ app.post('/api/purchase-orders/:id/receive', (req, res) => {
   try {
     const poId = Number(req.params.id);
     receivePurchaseOrder(poId);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
     res.json({ ok: true, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Failed to mark PO received' });
   }
 });
 
+app.post('/api/purchase-orders/:id/pay', (req, res) => {
+  try {
+    const poId = Number(req.params.id);
+    const mode = String(req.body?.payment_mode || 'UPI');
+    const po = getDashboardSnapshot().purchaseOrders.find((p) => p.id === poId);
+    if (!po) {
+      res.status(404).json({ error: 'Purchase order not found' });
+      return;
+    }
+    const paid = payPurchaseOrder(po.po_number, mode);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+    res.json({ ok: true, po: paid, snapshot: getDashboardSnapshot() });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to record PO payment' });
+  }
+});
+
 app.post('/api/approvals/:id/confirm', (req, res) => {
   try {
     const payload = resolveApproval(req.params.id, 'approved');
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
     res.json({ ok: true, payload, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Failed to confirm approval' });
@@ -493,6 +547,7 @@ app.post('/api/approvals/:id/confirm', (req, res) => {
 app.post('/api/approvals/:id/cancel', (req, res) => {
   try {
     const payload = resolveApproval(req.params.id, 'cancelled');
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
     res.json({ ok: true, payload, snapshot: getDashboardSnapshot() });
   } catch (err: any) {
     res.status(400).json({ error: err?.message || 'Failed to cancel approval' });
@@ -506,15 +561,13 @@ app.post('/api/khata/:id/payment', (req, res) => {
     res.status(400).json({ error: 'Invalid payment amount' });
     return;
   }
-  const cust = db.prepare('SELECT * FROM khata_customers WHERE id = ?').get(Number(req.params.id)) as any;
-  if (!cust) {
-    res.status(404).json({ error: 'Customer not found' });
-    return;
+  try {
+    recordKhataPayment(Number(req.params.id), parsed.data.amount);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+    res.json({ ok: true, snapshot: getDashboardSnapshot() });
+  } catch (err: any) {
+    res.status(404).json({ error: err?.message || 'Customer not found' });
   }
-  const nextBal = Math.max(0, cust.balance_due - parsed.data.amount);
-  db.prepare('UPDATE khata_customers SET balance_due = ?, last_activity = ? WHERE id = ?')
-    .run(nextBal, `Collected ₹${parsed.data.amount} at counter`, cust.id);
-  res.json({ ok: true, snapshot: getDashboardSnapshot() });
 });
 
 app.post('/api/reminders', (req, res) => {
@@ -531,23 +584,20 @@ app.post('/api/reminders', (req, res) => {
     res.status(400).json({ error: 'Invalid reminder details' });
     return;
   }
-  const d = parsed.data;
-  db.prepare(`
-    INSERT INTO reminders (type, title, description, party_name, amount, due_at, status, channel, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-  `).run(d.type, d.title, d.description, d.party_name, d.amount, new Date(Date.now() + 2 * 3600000).toISOString(), d.channel, new Date().toISOString());
+  createReminder(parsed.data);
+  emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
   res.json({ ok: true, snapshot: getDashboardSnapshot() });
 });
 
 app.post('/api/reminders/:id/action', (req, res) => {
-  const action = req.body?.action === 'snooze' ? 'snoozed' : 'completed';
-  if (action === 'snoozed') {
-    db.prepare('UPDATE reminders SET due_at = ? WHERE id = ?')
-      .run(new Date(Date.now() + 24 * 3600000).toISOString(), Number(req.params.id));
-  } else {
-    db.prepare("UPDATE reminders SET status = 'completed' WHERE id = ?").run(Number(req.params.id));
+  try {
+    const action = req.body?.action === 'snooze' ? 'snooze' : 'complete';
+    actionReminder(Number(req.params.id), action);
+    emitDashboardEvent({ type: 'snapshot_updated', source: 'ui' });
+    res.json({ ok: true, snapshot: getDashboardSnapshot() });
+  } catch (err: any) {
+    res.status(404).json({ error: err?.message || 'Reminder not found' });
   }
-  res.json({ ok: true, snapshot: getDashboardSnapshot() });
 });
 
 async function startServer() {

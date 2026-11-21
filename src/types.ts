@@ -97,6 +97,8 @@ export interface PurchaseOrderRow {
   gst_hsn_note: string;
   total_amount: number;
   status: string;
+  payment_status?: string;
+  payment_mode?: string;
   delivery_note: string;
   created_via: string;
   created_at: string;
@@ -213,6 +215,17 @@ export interface DashboardSnapshot {
   health: IntegrationHealthRow[];
 }
 
+export interface ClientAction {
+  type: 'download_invoice' | 'navigate' | 'set_language' | 'toast';
+  url?: string;
+  filename?: string;
+  label?: string;
+  tab?: NavTab;
+  language?: LanguageCode;
+  message?: string;
+  tone?: 'info' | 'success' | 'error';
+}
+
 export interface ConversationMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -224,6 +237,8 @@ export interface ConversationMessage {
   ttsProvider?: string | null;
   audioBase64?: string | null;
   audioMimeType?: string | null;
+  appliedChanges?: string[];
+  clientActions?: ClientAction[];
   suggestionAction?: {
     label: string;
     secondaryLabel?: string;

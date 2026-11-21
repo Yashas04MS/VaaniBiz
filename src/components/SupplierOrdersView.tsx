@@ -12,6 +12,8 @@ import {
   Landmark,
   X,
   ThumbsUp,
+  Download,
+  CreditCard,
 } from 'lucide-react';
 import type { DashboardSnapshot } from '../types';
 
@@ -21,6 +23,8 @@ interface SupplierOrdersViewProps {
   onCancelApproval: (approvalId: string) => Promise<void>;
   onDraftPO: (supplierId: number, productId: number, quantity: number) => Promise<void>;
   onReceivePO: (poId: number) => Promise<void>;
+  onPayPO: (poId: number, paymentMode?: string) => Promise<void>;
+  onDownloadInvoice: (type: 'sale' | 'purchase_order', ref: string) => Promise<void>;
   onTriggerVoicePrompt: (prompt: string) => Promise<void>;
 }
 
@@ -30,6 +34,8 @@ export function SupplierOrdersView({
   onCancelApproval,
   onDraftPO,
   onReceivePO,
+  onPayPO,
+  onDownloadInvoice,
   onTriggerVoicePrompt,
 }: SupplierOrdersViewProps) {
   const [subTab, setSubTab] = useState<'compare' | 'orders'>('compare');
@@ -454,6 +460,15 @@ export function SupplierOrdersView({
                       >
                         {po.status.replace('_', ' ')}
                       </span>
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                          po.payment_status === 'paid'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : 'bg-slate-200 text-slate-700'
+                        }`}
+                      >
+                        {po.payment_status === 'paid' ? `Paid • ${po.payment_mode || 'UPI'}` : 'Unpaid'}
+                      </span>
                     </div>
                     <div className="text-[11px] text-slate-500 mt-0.5">
                       {po.created_via} • {po.delivery_note}
@@ -477,8 +492,8 @@ export function SupplierOrdersView({
                   <div className="text-[11px] text-slate-500">{po.gst_hsn_note}</div>
                 </div>
 
-                <div className="flex items-center gap-3">
-                  <div className="text-right">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <div className="text-right mr-1">
                     <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                       Total Amount
                     </div>
@@ -486,6 +501,17 @@ export function SupplierOrdersView({
                       ₹{po.total_amount.toLocaleString('en-IN')}
                     </div>
                   </div>
+
+                  {po.payment_status !== 'paid' && po.status !== 'cancelled' && (
+                    <button
+                      type="button"
+                      onClick={() => onPayPO(po.id, 'UPI')}
+                      className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-[#0B1120] hover:bg-slate-800 text-[#F5D061] text-xs font-semibold whitespace-nowrap"
+                    >
+                      <CreditCard className="w-3.5 h-3.5" />
+                      <span>Pay UPI</span>
+                    </button>
+                  )}
 
                   {isDispatched && (
                     <button
@@ -496,6 +522,16 @@ export function SupplierOrdersView({
                       Mark Received
                     </button>
                   )}
+
+                  <button
+                    type="button"
+                    onClick={() => onDownloadInvoice('purchase_order', po.po_number)}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold whitespace-nowrap"
+                    title={`Download PO Invoice ${po.po_number}`}
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Invoice</span>
+                  </button>
                 </div>
               </div>
             );

@@ -16,6 +16,7 @@ import {
   BookOpen,
   Wallet,
   ShieldCheck,
+  Download,
 } from 'lucide-react';
 import type { DashboardSnapshot, ConversationMessage, NavTab } from '../types';
 import { AcousticWaveform } from './AcousticWaveform';
@@ -40,24 +41,24 @@ interface VoiceConsoleViewProps {
 
 const QUICK_PROMPTS = [
   {
-    title: '“Aaj ki kul bikri?”',
-    subtitle: 'Total revenue & cash split today',
-    command: 'Aaj ki kul bikri aur cash UPI split batao?',
+    title: '“Order 50kg Sugar & Pay UPI”',
+    subtitle: 'Place PO, pay supplier & download invoice',
+    command: 'Place an order for 50 kg Madhur sugar from Sri Ganesh Traders, pay via UPI, and download the invoice',
   },
   {
-    title: '“Atta stock check”',
-    subtitle: 'Aashirvaad 5kg & 10kg availability',
-    command: 'Check Aashirvaad atta 5kg and 10kg stock levels',
+    title: '“Bill 2 Atta + 1 Oil & Invoice”',
+    subtitle: 'Record POS sale, deduct stock & get PDF',
+    command: 'Record a UPI PhonePe sale for 2 Aashirvaad 5kg atta and 1 Fortune oil for Deepa Patel and download the invoice',
   },
   {
-    title: '“Remind Ramesh ₹ 2,500”',
-    subtitle: 'Send WhatsApp Khata note with UPI',
-    command: 'Create a WhatsApp payment reminder for Ramesh Kumar for 2500 rupees',
+    title: '“Add 40 Tata Salt & Set Reorder”',
+    subtitle: 'Auto-apply inventory & threshold changes',
+    command: 'Add 40 packets of Tata Salt to stock and update its reorder level to 30',
   },
   {
-    title: '“Top 5 fast moving items”',
-    subtitle: 'Velocity report for reorder planning',
-    command: 'Show top 5 fast moving items and low stock alerts',
+    title: '“Collect ₹2,500 Khata from Ramesh”',
+    subtitle: 'Settle Udhar balance & close reminder',
+    command: 'Record 2500 rupees Khata payment from Ramesh Kumar',
   },
 ];
 
@@ -82,8 +83,13 @@ export function VoiceConsoleView({
   const [dismissedActions, setDismissedActions] = useState<Record<string, boolean>>({});
   const [showAuditModal, setShowAuditModal] = useState(false);
   const feedEndRef = useRef<HTMLDivElement | null>(null);
+  const hasMountedRef = useRef(false);
 
   useEffect(() => {
+    if (!hasMountedRef.current) {
+      hasMountedRef.current = true;
+      return;
+    }
     feedEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }, [messages.length, isProcessing]);
 
@@ -304,6 +310,38 @@ export function VoiceConsoleView({
                       ) : (
                         <div className="space-y-3">
                           <p className="text-sm sm:text-[15px] text-slate-800 leading-relaxed">{msg.text}</p>
+
+                          {msg.appliedChanges && msg.appliedChanges.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {msg.appliedChanges.map((chg, idx) => (
+                                <span
+                                  key={idx}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-[11px] font-semibold text-emerald-800"
+                                >
+                                  <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                  <span>{chg}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
+                          {msg.clientActions && msg.clientActions.some((a) => a.type === 'download_invoice') && (
+                            <div className="flex flex-wrap items-center gap-2">
+                              {msg.clientActions
+                                .filter((a) => a.type === 'download_invoice' && a.url)
+                                .map((act, idx) => (
+                                  <a
+                                    key={idx}
+                                    href={act.url}
+                                    download={act.filename || 'VaaniBiz-Invoice.pdf'}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#0B1120] hover:bg-slate-800 text-[#F5D061] text-xs font-semibold transition-colors"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                    <span>{act.label || 'Download PDF Invoice'}</span>
+                                  </a>
+                                ))}
+                            </div>
+                          )}
 
                           {msg.suggestionAction && !dismissedActions[msg.id] && (
                             <div className="space-y-3 pt-1">

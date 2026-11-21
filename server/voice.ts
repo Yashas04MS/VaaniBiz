@@ -1,6 +1,12 @@
 import agoraToken from 'agora-token';
 import crypto from 'crypto';
-import { db, recordHealth } from './db.ts';
+import {
+  createAgentSession,
+  endAgentSession,
+  getAgentSession,
+  recordHealth,
+  updateAgentSessionAgentId,
+} from './db.ts';
 import { createGeminiClient, getGeminiDiagnostics } from './geminiClient.ts';
 
 const { RtcTokenBuilder, RtcRole } = agoraToken;
@@ -195,10 +201,7 @@ export async function startAgoraSession(params: {
   const { token: userToken, appId } = mintAgoraRtcToken(channel, userUid);
   const { token: agentToken } = mintAgoraRtcToken(channel, agentUid);
 
-  db.prepare(`
-    INSERT INTO agent_sessions (id, channel, language, started_at)
-    VALUES (?, ?, ?, ?)
-  `).run(sessionId, channel, params.language || 'en', new Date().toISOString());
+  createAgentSession(sessionId, channel, params.language || 'en');
 
   const customerId = process.env.AGORA_CUSTOMER_ID;
   const customerSecret = process.env.AGORA_CUSTOMER_SECRET;
@@ -233,10 +236,10 @@ export async function startAgoraSession(params: {
             system_messages: [
               {
                 role: 'system',
-                content: 'You are Vaani, voice operations AI for Sri Lakshmi Kirana.',
+                content: 'You are Vaani, Agora Voice AI operations engine for Sri Lakshmi Kirana. Execute orders, payments, invoice downloads, and store updates automatically.',
               },
             ],
-            greeting_message: 'Namaskara Suresh! VaaniBiz is live. Boliye, kya madad karoon?',
+            greeting_message: 'Namaskara Suresh! Agora Voice AI is live. Tell me to place orders, make payments, update stock, or download invoices.',
             params: {
               model: getGeminiDiagnostics().primaryModel,
             },
@@ -269,11 +272,13 @@ export async function startAgoraSession(params: {
         agentId = parsed.agent_id || null;
         convoAiActive = Boolean(agentId);
         convoAiNote = `Agora ConvoAI Agent ${agentId} joined channel #${channel}`;
-        db.prepare('UPDATE agent_sessions SET agent_id = ? WHERE id = ?').run(agentId, sessionId);
+        if (agentId) {
+          updateAgentSessionAgentId(sessionId, agentId);
+        }
       } else {
         convoAiNote = `Agora RTC connected (ConvoAI standby: ${res.status})`;
       }
-    } catch (err: any) {
+    } catch {
       convoAiNote = `Agora RTC connected (Direct voice turn active)`;
     }
   }
@@ -296,10 +301,10 @@ export async function startAgoraSession(params: {
 }
 
 export async function stopAgoraSession(sessionId: string) {
-  const session = db.prepare('SELECT * FROM agent_sessions WHERE id = ?').get(sessionId) as any;
+  const session = getAgentSession(sessionId);
   if (!session) return { stopped: true };
 
-  db.prepare('UPDATE agent_sessions SET ended_at = ? WHERE id = ?').run(new Date().toISOString(), sessionId);
+  endAgentSession(sessionId);
 
   const appId = process.env.AGORA_APP_ID;
   const customerId = process.env.AGORA_CUSTOMER_ID;
