@@ -1,0 +1,6 @@
+{
+  "name": "VaaniBiz — Merchant Voice OS",
+  "description": "Multilingual voice-first retail & kirana operations OS powered by Agora RTC, Gemini AI, and Murf Falcon TTS.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
